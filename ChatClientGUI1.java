@@ -2,19 +2,29 @@
 import java.io.*;
 import java.net.*;
 import java.security.*;
-import java.util.*;
+import java.util.List;
+import java.util.Map;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.Base64;
 
 // GUI Libraries (Swing & AWT)
 import javax.swing.*;
 import javax.swing.border.*;
-import java.awt.*;
-import java.awt.event.*;
 
-// Layout Managers & Components
-import java.awt.FlowLayout;
+// Import specific AWT classes instead of java.awt.*
+import java.awt.Color;
+import java.awt.Font;
+import java.awt.Dimension;
 import java.awt.BorderLayout;
+import java.awt.FlowLayout;
+import java.awt.event.*;
+import java.awt.image.BufferedImage;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.FontMetrics;
+import java.awt.Cursor;
 
 // Cryptography (AES-GCM)
 import javax.crypto.Cipher;
@@ -22,15 +32,14 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 // Image Handling
-import java.awt.image.BufferedImage;
 import javax.imageio.ImageIO;
-
 
 public class ChatClientGUI1 {
     private static final String HOST = "localhost";
     private static final int PORT = 2013;
-    private static final byte[] AES_KEY = "0123456789abcdef0123456789abcdef".getBytes();
-    private static final int IV_LENGTH = 12;
+    private static final byte[] AES_KEY = "0123456789abcdef0123456789abcdef".getBytes(); // Must match server
+    private static final int IV_LENGTH = 12; // 96-bit IV for AES-GCM
+    private static final int HEARTBEAT_INTERVAL = 5; // Seconds
 
     // UI Colors and Fonts
     private static final Color PRIMARY_COLOR = new Color(52, 152, 219);
@@ -145,7 +154,7 @@ public class ChatClientGUI1 {
                 BorderFactory.createMatteBorder(0, 0, 1, 0, new Color(189, 195, 199)),
                 BorderFactory.createEmptyBorder(5, 5, 5, 5)));
 
-        userListModel = new DefaultListModelEdition<String>();
+        userListModel = new DefaultListModel<>();
         userList = new JList<>(userListModel);
         userList.setFont(DEFAULT_FONT);
         userList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
@@ -347,14 +356,16 @@ public class ChatClientGUI1 {
 
     private static void sendPublicMessage(String message) {
         if (out != null) {
-            out.println("PUBLIC:" + message);
+            String encrypted = encrypt(myUsername + ":" + message);
+            out.println("CHAT:" + encrypted);
             appendToPublicChat("You: " + message);
         }
     }
 
     private static void sendPrivateMessage(String recipient, String message) {
         if (out != null) {
-            out.println("PRIVATE:" + recipient + ":" + message);
+            String encrypted = encrypt(myUsername + ":" + message);
+            out.println("PRIVATE:" + recipient + ":" + encrypted);
             int tabIndex = getTabIndex(recipient);
             if (tabIndex != -1) {
                 JScrollPane scrollPane = (JScrollPane) privateChatTabs.getComponentAt(tabIndex);
@@ -403,19 +414,19 @@ public class ChatClientGUI1 {
         BufferedImage image = new BufferedImage(24, 24, BufferedImage.TYPE_INT_ARGB);
         Graphics2D g2d = image.createGraphics();
         g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-        
+
         g2d.setColor(background);
         g2d.fillOval(0, 0, 24, 24);
-        
+
         g2d.setColor(foreground);
         g2d.setFont(new Font(DEFAULT_FONT.getName(), Font.BOLD, 12));
         FontMetrics fm = g2d.getFontMetrics();
         int textWidth = fm.stringWidth(text);
         int textHeight = fm.getHeight();
-        
+
         g2d.drawString(text, (24 - textWidth) / 2, (24 - textHeight) / 2 + fm.getAscent());
         g2d.dispose();
-        
+
         return image;
     }
 
@@ -424,21 +435,28 @@ public class ChatClientGUI1 {
             socket = new Socket(HOST, PORT);
             out = new PrintWriter(socket.getOutputStream(), true);
             in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            out.println(myUsername);
+            out.println("JOIN:" + myUsername); // Send JOIN message
 
             statusLabel.setText("Connected as " + myUsername);
             statusLabel.setForeground(ACCENT_COLOR);
 
+            // Start heartbeat thread
+            new Thread(ChatClientGUI1::sendHeartbeat).start();
+
+            // Start receiving messages
             new Thread(() -> {
                 try {
                     String line;
                     while ((line = in.readLine()) != null) {
-                        if (line.startsWith("USERLIST:")) {
-                            updateUserList(Arrays.asList(line.substring(9).split(",")));
-                        } else if (line.startsWith("PUBLIC:")) {
-                            appendToPublicChat(line.substring(7));
+                        if (line.startsWith("ASSIGNED_ID:")) {
+                            myId = Integer.parseInt(line.substring(12));
+                            SwingUtilities.invokeLater(() -> frame.setTitle("Chat - " + myUsername + " (ID: " + myId + ")"));
+                        } else if (line.startsWith("CHAT:")) {
+                            String decrypted = decrypt(line.substring(5));
+                            SwingUtilities.invokeLater(() -> appendToPublicChat(decrypted));
                         } else if (line.startsWith("PRIVATE:")) {
-                            String[] parts = line.substring(8).split(":", 2);
+                            String decrypted = decrypt(line.substring(8));
+                            String[] parts = decrypted.split(":", 2);
                             String sender = parts[0];
                             String message = parts[1];
                             SwingUtilities.invokeLater(() -> {
@@ -447,7 +465,14 @@ public class ChatClientGUI1 {
                                 JScrollPane scrollPane = (JScrollPane) privateChatTabs.getComponentAt(tabIndex);
                                 JTextArea chatArea = (JTextArea) scrollPane.getViewport().getView();
                                 chatArea.append(sender + ": " + message + "\n");
+                                chatArea.setCaretPosition(chatArea.getDocument().getLength());
                             });
+                        } else if (line.startsWith("USERLIST:")) {
+                            String decryptedList = decrypt(line.substring(9));
+                            updateUserList(decryptedList);
+                        } else if (line.startsWith("ERROR:")) {
+                            String error = line.substring(6);
+                            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(frame, error));
                         }
                     }
                 } catch (IOException e) {
@@ -464,18 +489,83 @@ public class ChatClientGUI1 {
         }
     }
 
-    private static void updateUserList(List<String> userNames) {
-        userListModel.clear();
-        userNames.forEach(userListModel::addElement);
+    private static void sendHeartbeat() {
+        while (true) {
+            if (out != null) {
+                out.println("HEARTBEAT");
+            }
+            try {
+                Thread.sleep(HEARTBEAT_INTERVAL * 1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private static void updateUserList(String userList) {
+        final String processedUserList;
+        if (userList.startsWith("USERLIST:")) {
+            processedUserList = userList.substring(9);
+        } else {
+            processedUserList = userList;
+        }
+
+        SwingUtilities.invokeLater(() -> {
+            userListModel.clear();
+            if (processedUserList.trim().isEmpty()) return;
+
+            String[] entries = processedUserList.split(";");
+            for (String entry : entries) {
+                String[] parts = entry.split(":");
+                if (parts.length < 2) continue;
+                String name = parts[1].trim();
+                userListModel.addElement(name);
+            }
+        });
     }
 
     private static void disconnect() {
         try {
+            if (out != null) out.println("EXIT");
             if (out != null) out.close();
             if (in != null) in.close();
             if (socket != null) socket.close();
         } catch (IOException e) {
             e.printStackTrace();
+        }
+    }
+
+    private static String encrypt(String plaintext) {
+        try {
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            byte[] iv = new byte[IV_LENGTH];
+            new SecureRandom().nextBytes(iv);
+            SecretKeySpec keySpec = new SecretKeySpec(AES_KEY, "AES");
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(128, iv);
+            cipher.init(Cipher.ENCRYPT_MODE, keySpec, gcmSpec);
+            byte[] encrypted = cipher.doFinal(plaintext.getBytes("UTF-8"));
+            byte[] encryptedMessage = new byte[IV_LENGTH + encrypted.length];
+            System.arraycopy(iv, 0, encryptedMessage, 0, IV_LENGTH);
+            System.arraycopy(encrypted, 0, encryptedMessage, IV_LENGTH, encrypted.length);
+            return Base64.getEncoder().encodeToString(encryptedMessage);
+        } catch (Exception e) {
+            throw new RuntimeException("Encryption error", e);
+        }
+    }
+
+    private static String decrypt(String ciphertext) {
+        try {
+            byte[] decodedMessage = Base64.getDecoder().decode(ciphertext);
+            byte[] iv = Arrays.copyOfRange(decodedMessage, 0, IV_LENGTH);
+            byte[] encrypted = Arrays.copyOfRange(decodedMessage, IV_LENGTH, decodedMessage.length);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            SecretKeySpec keySpec = new SecretKeySpec(AES_KEY, "AES");
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(128, iv);
+            cipher.init(Cipher.DECRYPT_MODE, keySpec, gcmSpec);
+            byte[] decrypted = cipher.doFinal(encrypted);
+            return new String(decrypted, "UTF-8");
+        } catch (Exception e) {
+            throw new RuntimeException("Decryption error", e);
         }
     }
 }
